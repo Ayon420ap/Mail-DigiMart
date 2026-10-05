@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: telegram-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /Bot2_Deposit_Cancel_Updated.php
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false

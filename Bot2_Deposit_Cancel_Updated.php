@@ -46,35 +46,105 @@ const APP_VERSION = 'Mail V3 Updated 1.1';
 
 function ensureDataDir(): void
 {
-    if (!is_dir(DATA_DIR)) {
-        mkdir(DATA_DIR, 0755, true);
-    }
+    // Render's local filesystem is ephemeral, so bot state is stored in PostgreSQL.
+    // The directory is kept only for temporary/runtime compatibility.
+    $pdo = db();
+    $pdo->exec("CREATE TABLE IF NOT EXISTS bot_json_store (
+        name TEXT PRIMARY KEY,
+        data JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )");
 
-    $files = [
-        USERS_FILE,
-        PRODUCTS_FILE,
-        DEPOSITS_FILE,
-        ORDERS_FILE,
-        STATES_FILE,
-        SETTINGS_FILE,
-        UPDATES_FILE,
-        LOGS_FILE
+    $defaults = [
+        'users.json' => '{}', 'products.json' => '{}', 'deposits.json' => '{}',
+        'orders.json' => '{}', 'states.json' => '{}', 'settings.json' => json_encode([
+            'price'=>1,'catalog'=>[],'orders_enabled'=>true,'deposits_enabled'=>true,
+            'referral_enabled'=>true,'broadcast_enabled'=>true,'maintenance'=>false,'premium_emojis'=>[]
+        ]),
+        'processed_updates.json' => '{}', 'admin_logs.json' => '{}'
     ];
 
-    foreach ($files as $file) {
-        if (!file_exists($file)) {
-            file_put_contents($file, '{}', LOCK_EX);
+    $stmt = $pdo->prepare("INSERT INTO bot_json_store(name,data) VALUES(:name, CAST(:data AS jsonb)) ON CONFLICT (name) DO NOTHING");
+    foreach ($defaults as $name => $json) {
+        $legacyPath = DATA_DIR . '/' . $name;
+        if (is_file($legacyPath)) {
+            $legacy = file_get_contents($legacyPath);
+            if ($legacy !== false && json_decode($legacy, true) !== null) $json = $legacy;
         }
+        $stmt->execute([':name'=>$name, ':data'=>$json]);
     }
 }
 
-ensureDataDir();
 
 
 function botToken(): string
 {
-    return defined('BOT_TOKEN') ? (string) BOT_TOKEN : '';
+    return trim((string)(getenv('BOT_TOKEN') ?: ($_ENV['BOT_TOKEN'] ?? '')));
 }
+
+function databaseUrl(): string
+{
+    return trim((string)(getenv('DATABASE_URL') ?: ($_ENV['DATABASE_URL'] ?? '')));
+}
+
+function db(): PDO
+{
+    static $pdo = null;
+    if ($pdo instanceof PDO) return $pdo;
+
+    $url = databaseUrl();
+    if ($url === '') {
+        throw new RuntimeException('DATABASE_URL is not configured');
+    }
+
+    $parts = parse_url($url);
+    if ($parts === false || empty($parts['host']) || empty($parts['user'])) {
+        throw new RuntimeException('Invalid DATABASE_URL');
+    }
+
+    $scheme = strtolower((string)($parts['scheme'] ?? ''));
+    if ($scheme === 'postgres') $scheme = 'pgsql';
+    if ($scheme !== 'pgsql') {
+        throw new RuntimeException('Only PostgreSQL DATABASE_URL is supported');
+    }
+
+    $host = $parts['host'];
+    $port = $parts['port'] ?? 5432;
+    $user = rawurldecode($parts['user']);
+    $pass = rawurldecode($parts['pass'] ?? '');
+    $dbName = ltrim($parts['path'] ?? '', '/');
+    $dbName = rawurldecode($dbName);
+
+    $dsn = "pgsql:host={$host};port={$port};dbname={$dbName};sslmode=require";
+    $pdo = new PDO($dsn, $user, $pass, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES => false,
+    ]);
+    return $pdo;
+}
+
+ensureDataDir();
+
+// Browser/Render health check. Telegram webhook requests are POST.
+if (($_SERVER['REQUEST_METHOD'] ?? 'POST') === 'GET') {
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['ok'=>true,'service'=>'telegram-bot','version'=>APP_VERSION]);
+    exit;
+}
+
+function verifyWebhookSecret(): void
+{
+    $expected = trim((string)(getenv('WEBHOOK_SECRET') ?: ''));
+    if ($expected === '') return;
+    $received = (string)($_SERVER['HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN'] ?? '');
+    if (!hash_equals($expected, $received)) {
+        http_response_code(403);
+        exit;
+    }
+}
+
+verifyWebhookSecret();
 
 
 function api(string $method, array $data = []): array
@@ -125,51 +195,31 @@ function api(string $method, array $data = []): array
 }
 
 
+function jsonStoreName(string $file): string
+{
+    return basename($file);
+}
+
 function loadJson(string $file, array $default = []): array
 {
-    if (!file_exists($file)) {
-        return $default;
-    }
-
-    $content = file_get_contents($file);
-
-    if ($content === false || trim($content) === '') {
-        return $default;
-    }
-
-    $data = json_decode($content, true);
-
+    $stmt = db()->prepare('SELECT data::text AS data FROM bot_json_store WHERE name = :name');
+    $stmt->execute([':name'=>jsonStoreName($file)]);
+    $row = $stmt->fetch();
+    if (!$row) return $default;
+    $data = json_decode((string)$row['data'], true);
     return is_array($data) ? $data : $default;
 }
 
-
 function saveJson(string $file, array $data): bool
 {
-    $json = json_encode(
-        $data,
-        JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
-    );
-
-    if ($json === false) {
-        return false;
-    }
-
-    // Atomic write: prevents a partially-written JSON file if the request is interrupted.
-    $tmp = $file . '.tmp.' . bin2hex(random_bytes(4));
-    $written = file_put_contents($tmp, $json, LOCK_EX);
-
-    if ($written === false) {
-        @unlink($tmp);
-        return false;
-    }
-
-    if (!@rename($tmp, $file)) {
-        @unlink($tmp);
-        return false;
-    }
-
+    $json = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    if ($json === false) return false;
+    $stmt = db()->prepare("INSERT INTO bot_json_store(name,data,updated_at) VALUES(:name, CAST(:data AS jsonb), NOW())
+        ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()");
+    $stmt->execute([':name'=>jsonStoreName($file), ':data'=>$json]);
     return true;
 }
+
 
 function isDuplicateUpdate(array $update): bool
 {
